@@ -3,6 +3,23 @@ class UIManager {
         this.audio = audioEngine;
         this.grid = document.getElementById('grid-container');
         this.chatMessages = document.getElementById('chat-messages');
+        this.mutedPeers = {}; // peerId -> bool (remote mute state shared by peers)
+    }
+
+    // Escape user-controlled strings before injecting into innerHTML (XSS protection)
+    escapeHtml(str) {
+        if (str == null) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // Trusted "(Hôte)" badge markup (kept as HTML, never escaped)
+    hostBadge() {
+        return ' <span style="color:var(--primary); font-size:0.8em; font-weight:bold;">(Hôte)</span>';
     }
 
     createLocalCard(peerId, label) {
@@ -12,8 +29,64 @@ class UIManager {
         const card = this.createCardElement('local', label, true, isRoomHost);
         this.grid.appendChild(card);
         this.setupDeviceSelectors('local');
+        this.setupLocalNameEdit('local', isRoomHost);
         this.startVULoop('local');
         this.checkEmptyState();
+    }
+
+    // Make the local card name editable: click -> input, Enter/blur -> commit.
+    // On commit we update the display, persist the name and broadcast it to peers.
+    setupLocalNameEdit(id, isRoomHost) {
+        const nameEl = document.getElementById(`name-${id}`);
+        if (!nameEl) return;
+
+        nameEl.style.cursor = 'pointer';
+        nameEl.title = 'Cliquer pour renommer';
+
+        nameEl.addEventListener('click', () => {
+            // Already editing? Ignore re-entry.
+            if (nameEl.querySelector('input')) return;
+
+            // Current name, without the trusted "(Hôte)" badge
+            const currentName = nameEl.textContent.replace(' (Hôte)', '').replace('(Hôte)', '').trim();
+
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = currentName;
+            input.maxLength = 30;
+            input.style.cssText = 'width:90%; text-align:center; font-size:1.2rem; padding:2px 6px; ' +
+                'border-radius:4px; border:1px solid var(--primary); background:var(--bg-input); color:var(--text-main);';
+
+            nameEl.innerHTML = '';
+            nameEl.appendChild(input);
+            input.focus();
+            input.select();
+
+            let finished = false;
+            const finish = (save) => {
+                if (finished) return;
+                finished = true;
+
+                const newName = save ? (input.value.trim() || currentName) : currentName;
+
+                // Rebuild the name display (escaped) + host badge
+                let displayName = this.escapeHtml(newName);
+                if (isRoomHost) displayName += this.hostBadge();
+                nameEl.innerHTML = displayName;
+
+                // Persist + broadcast only when the name actually changed
+                if (save && newName !== currentName) {
+                    localStorage.setItem('peerCallName', newName);
+                    document.dispatchEvent(new CustomEvent('my-name-changed', { detail: { name: newName } }));
+                }
+            };
+
+            input.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+                else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+            });
+            input.addEventListener('blur', () => finish(true));
+        });
     }
 
     createRemoteCard(peerId, label) {
@@ -49,6 +122,9 @@ class UIManager {
             });
         }
 
+        // Re-apply any mute state that arrived before this card existed
+        if (this.mutedPeers[peerId]) this.setPeerMuted(peerId, true);
+
         this.checkEmptyState();
     }
 
@@ -58,6 +134,9 @@ class UIManager {
         // also remove audio element
         const audio = document.getElementById(`audio-${peerId}`);
         if (audio) audio.remove();
+
+        // Forget any shared mute state for this peer
+        delete this.mutedPeers[peerId];
 
         this.checkEmptyState();
     }
@@ -103,7 +182,7 @@ class UIManager {
 
                 inviteCard.innerHTML = `
                     <div style="text-align:center; color: var(--text-muted);">
-                        <i class="fas fa-plus-circle" style="font-size: 2rem; margin-bottom: 10px;"></i>
+                        <div style="font-size: 2rem; margin-bottom: 10px;">➕</div>
                         <h3>Inviter un coanimateur</h3>
                         <img src="${qrUrl}" style="width:100px; height:100px; margin:10px 0; border-radius:4px;">
                         <p style="font-size:0.8rem; word-break:break-all; user-select: text;">${url}</p>
@@ -134,6 +213,27 @@ class UIManager {
 
         const ctx = canvas.getContext('2d');
 
+        // dBFS scale: -60 dB (left) .. 0 dB (right)
+        const FLOOR_DB = -60;
+        const MARKS = [-60, -40, -20, -6, 0];
+        const DECAY_DB_PER_SEC = 12; // peak-hold falls a few dB per second
+
+        // Meter ballistics: time constants (seconds) for the smoothed bar.
+        // Fast attack so peaks are caught, slow release so the bar stops trembling.
+        // Purely a display filter — no audio is buffered, latency is unchanged.
+        const ATTACK_T = 0.05;  // rise toward a louder value
+        const RELEASE_T = 0.35; // fall toward a quieter value
+
+        let peakHoldDb = FLOOR_DB;
+        let displayRmsDb = FLOOR_DB; // smoothed value actually drawn
+        let lastTime = performance.now();
+
+        // Map a dB value to an x pixel position (clamped to the meter range)
+        const dbToX = (db, width) => {
+            const clamped = Math.max(FLOOR_DB, Math.min(0, db));
+            return ((clamped - FLOOR_DB) / (0 - FLOOR_DB)) * width;
+        };
+
         const draw = () => {
             // 1. Check if element still exists
             const card = document.getElementById(`card-${id}`);
@@ -163,25 +263,84 @@ class UIManager {
 
             if (width === 0 || height === 0) return; // Nothing to draw
 
-            // ALWAYS MONO drawing logic as requested to revert
-            const valL = this.audio.getAudioLevel(id, 0) || 0;
-            const valR = this.audio.getAudioLevel(id, 1) || 0;
-            const value = Math.max(valL, valR);
+            // Time delta for peak-hold decay
+            const now = performance.now();
+            const dt = Math.min(0.25, (now - lastTime) / 1000);
+            lastTime = now;
 
-            // Draw Horizontal Bar
-            const barHeight = height * 0.6; // Slightly thinner bar
-            const barWidth = width * (value / 255);
-            const x = 0;
-            const y = (height - barHeight) / 2; // Center vertically
+            // RMS + instantaneous peak in dBFS (mono)
+            const stats = this.audio.getAudioStats(id);
+            const rmsDb = stats.rms;
+            const peakDb = stats.peak;
 
-            // Gradient Color (Horizontal)
+            // Peak-hold: jump up instantly, decay slowly
+            if (peakDb > peakHoldDb) {
+                peakHoldDb = peakDb;
+            } else {
+                peakHoldDb = Math.max(FLOOR_DB, peakHoldDb - DECAY_DB_PER_SEC * dt);
+            }
+
+            // Smooth the RMS bar with attack/release ballistics (frame-rate independent).
+            // This calms the trembling without delaying the audio.
+            const tConst = rmsDb > displayRmsDb ? ATTACK_T : RELEASE_T;
+            const alpha = 1 - Math.exp(-dt / tConst);
+            displayRmsDb += (rmsDb - displayRmsDb) * alpha;
+
+            const muted = !!this.mutedPeers[id];
+
+            // Bar geometry (centered horizontal bar)
+            const barHeight = height * 0.6;
+            const y = (height - barHeight) / 2;
+            const barWidth = dbToX(displayRmsDb, width);
+
+            // Scale reference grid (drawn faint, behind the bar)
+            ctx.fillStyle = 'rgba(255,255,255,0.15)';
+            MARKS.forEach(mark => {
+                const mx = Math.min(width - 1, dbToX(mark, width));
+                ctx.fillRect(mx, 0, 1, height);
+            });
+
+            // Gradient Color (Horizontal): green -> yellow -> red
             const gradient = ctx.createLinearGradient(0, 0, width, 0);
             gradient.addColorStop(0, '#22c55e'); // Green
             gradient.addColorStop(0.6, '#f59e0b'); // Yellow
             gradient.addColorStop(1, '#ef4444'); // Red
 
+            // Grey the meter out when this peer is muted
+            ctx.globalAlpha = muted ? 0.25 : 1.0;
+
             ctx.fillStyle = gradient;
-            ctx.fillRect(x, y, barWidth, barHeight);
+            ctx.fillRect(0, y, barWidth, barHeight);
+
+            // Peak-hold vertical marker
+            if (peakHoldDb > FLOOR_DB) {
+                const px = Math.min(width - 2, dbToX(peakHoldDb, width));
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(px, y, 2, barHeight);
+            }
+
+            ctx.globalAlpha = 1.0;
+
+            // Scale labels (small, only when there's room)
+            if (height >= 18) {
+                ctx.fillStyle = 'rgba(255,255,255,0.45)';
+                ctx.font = '7px system-ui, sans-serif';
+                ctx.textBaseline = 'bottom';
+                MARKS.forEach(mark => {
+                    const mx = dbToX(mark, width);
+                    if (mark === FLOOR_DB) {
+                        ctx.textAlign = 'left';
+                        ctx.fillText(`${mark}`, 1, height - 1);
+                    } else if (mark === 0) {
+                        ctx.textAlign = 'right';
+                        ctx.fillText('0', width - 1, height - 1);
+                    } else {
+                        ctx.textAlign = 'center';
+                        ctx.fillText(`${mark}`, mx, height - 1);
+                    }
+                });
+                ctx.textAlign = 'left'; // reset
+            }
         };
 
         // Start
@@ -198,11 +357,12 @@ class UIManager {
         const amIHost = !window.location.hash || window.location.hash === '#';
 
         // Standardize Host Badge
-        // Remove text-based "(Hôte)" if present in name to avoid double labeling if passed
-        let displayName = name.replace(' (Hôte)', '').replace('(Hôte)', '');
+        // Remove text-based "(Hôte)" if present in name to avoid double labeling if passed,
+        // then escape the user-controlled name before injecting it into innerHTML (XSS protection).
+        let displayName = this.escapeHtml(name.replace(' (Hôte)', '').replace('(Hôte)', ''));
 
         if (isRoomHost) {
-            displayName += ' <span style="color:var(--primary); font-size:0.8em; font-weight:bold;">(Hôte)</span>';
+            displayName += this.hostBadge();
         }
 
         const nameHtml = `<div class="user-name" id="name-${id}" style="font-size: 1.4rem; text-align: center; width: 100%; display: block;">${displayName}</div>`;
@@ -226,12 +386,31 @@ class UIManager {
                 <canvas id="vu-${id}" class="vu-canvas"></canvas>
             </div>
 
+            ${!isLocal ? `
+            <div class="volume-control">
+                <span class="volume-icon" title="Volume">🔊</span>
+                <input type="range" id="vol-${id}" class="volume-slider" min="0" max="100" value="100" title="Volume de ce participant">
+                <span class="volume-value" id="vol-val-${id}">100%</span>
+            </div>
+            ` : ''}
+
             <div class="card-actions" style="display: flex; justify-content: center; padding-top: 10px; width: 100%;">
                 <button class="btn btn-secondary btn-mute" title="Couper/Activer le son">MUTE</button>
                 ${!isLocal && amIHost ? `<div style="width: 10px;"></div><button class="btn btn-danger btn-eject" title="Éjecter">X</button>` : ''}
             </div>
 
-            ${statusHtml}
+            ${isLocal ? statusHtml : `
+            <div class="status-quality-row" style="display: flex; justify-content: center; align-items: center; gap: 14px; margin-top: 8px; flex-wrap: wrap;">
+                <div class="status-container" style="display: flex; align-items: center; gap: 8px;">
+                    <span id="status-${id}" class="status-dot"></span>
+                    <span id="status-text-${id}" style="font-size: 0.85rem; color: var(--text-muted);">${initialStatusText}</span>
+                </div>
+                <div class="quality-indicator" id="quality-${id}" title="Qualité de connexion">
+                    <span class="quality-dot quality-unknown"></span>
+                    <span class="quality-rtt">-- ms</span>
+                </div>
+            </div>
+            `}
 
             <div class="device-controls" style="margin-top: 10px;">
                 ${isLocal ? `
@@ -267,10 +446,25 @@ class UIManager {
 
             if (isLocal) {
                 this.audio.muteLocal(isMuted);
+                // Share our mute state with all peers (handled/broadcast in app.js)
+                document.dispatchEvent(new CustomEvent('local-mute-changed', { detail: { muted: isMuted } }));
             } else {
                 this.audio.mutePeer(id, isMuted);
             }
         });
+
+        // Per-peer volume fader (remote cards only). Mute (audio.muted) still overrides it.
+        if (!isLocal) {
+            const volSlider = div.querySelector('.volume-slider');
+            const volVal = div.querySelector('.volume-value');
+            if (volSlider) {
+                volSlider.addEventListener('input', (e) => {
+                    const pct = e.target.value;
+                    this.audio.setPeerVolume(id, pct / 100);
+                    if (volVal) volVal.textContent = `${pct}%`;
+                });
+            }
+        }
 
         // NO STEREO CHECKBOX EVENT
         // NOTE: Remote buttons (mute/eject) logic was previously outside this function in createRemoteCard.
@@ -299,15 +493,35 @@ class UIManager {
         }
     }
 
+    // Live link-health indicator: colored dot (good/medium/bad) + RTT, details in tooltip
+    updateConnectionQuality(peerId, stats) {
+        const el = document.getElementById(`quality-${peerId}`);
+        if (!el || !stats) return;
+
+        const { quality, rttMs, lossPct, jitterMs } = stats;
+        const dot = el.querySelector('.quality-dot');
+        const rttLabel = el.querySelector('.quality-rtt');
+
+        if (dot) dot.className = `quality-dot quality-${quality || 'unknown'}`;
+
+        const hasRtt = rttMs != null && !isNaN(rttMs);
+        if (rttLabel) rttLabel.textContent = hasRtt ? `${Math.round(rttMs)} ms` : '-- ms';
+
+        const lossTxt = (typeof lossPct === 'number') ? lossPct.toFixed(1) : '0.0';
+        const jitterTxt = (typeof jitterMs === 'number') ? jitterMs.toFixed(1) : '0.0';
+        el.title = `Qualité: ${quality || 'inconnue'} · Perte: ${lossTxt}% · Jitter: ${jitterTxt} ms · RTT: ${hasRtt ? Math.round(rttMs) + ' ms' : '--'}`;
+    }
+
     updatePeerName(peerId, name) {
         const el = document.getElementById(`name-${peerId}`);
         if (el) {
             // Check if this peer is the host
             const roomHostId = window.location.hash.substring(1);
-            let displayName = name.replace(' (Hôte)', '').replace('(Hôte)', '');
+            // Escape the user-controlled name before injecting it into innerHTML (XSS protection)
+            let displayName = this.escapeHtml(name.replace(' (Hôte)', '').replace('(Hôte)', ''));
 
             if (roomHostId && peerId === roomHostId) {
-                displayName += ' <span style="color:var(--primary); font-size:0.8em; font-weight:bold;">(Hôte)</span>';
+                displayName += this.hostBadge();
             }
 
             el.innerHTML = displayName;
@@ -318,6 +532,31 @@ class UIManager {
         const el = document.getElementById(`device-${peerId}`);
         if (el) {
             el.textContent = `Micro Distant: ${deviceName}`;
+        }
+    }
+
+    // Reflect a peer's shared mute state: 🔇 badge on the card + greyed VU meter
+    // (the VU loop reads this.mutedPeers[peerId]).
+    setPeerMuted(peerId, muted) {
+        // Store first so a card created later (stream arriving after metadata) can re-apply it.
+        this.mutedPeers[peerId] = !!muted;
+
+        const card = document.getElementById(`card-${peerId}`);
+        if (!card) return;
+
+        let badge = document.getElementById(`mute-badge-${peerId}`);
+        if (muted) {
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.id = `mute-badge-${peerId}`;
+                badge.className = 'mute-badge';
+                badge.textContent = '🔇';
+                badge.title = 'Micro coupé';
+                badge.style.cssText = 'position:absolute; top:8px; right:8px; font-size:1rem;';
+                card.appendChild(badge);
+            }
+        } else if (badge) {
+            badge.remove();
         }
     }
 
@@ -375,7 +614,8 @@ class UIManager {
         if (isSystem) {
             div.textContent = text;
         } else {
-            div.innerHTML = `<span class="author">${author}:</span> ${text}`;
+            // Escape author + text to prevent code execution from a malicious peer
+            div.innerHTML = `<span class="author">${this.escapeHtml(author)}:</span> ${this.escapeHtml(text)}`;
         }
 
         this.chatMessages.appendChild(div);

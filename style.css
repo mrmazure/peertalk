@@ -22,7 +22,7 @@
   --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
   --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -2px rgb(0 0 0 / 0.05);
 
-  --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  --font-family: system-ui, -apple-system, sans-serif;
   --radius: 8px;
 }
 
@@ -272,26 +272,24 @@ header {
   gap: 15px;
 }
 
-/* User Card */
+/* User Card (merged: single coherent rule) */
 .user-card {
   background: var(--bg-surface);
-  border-radius: 8px;
-  padding: 8px;
-  /* Compact padding */
+  border-radius: 12px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
   border: 1px solid var(--border);
   box-shadow: var(--shadow-sm);
   position: relative;
-  transition: box-shadow 0.2s;
-  /* Removed transform */
+  transition: transform 0.2s, box-shadow 0.2s;
   min-height: auto;
   /* Allow auto height */
-  flex: 1 1 300px;
-  /* Responsive width */
-  max-width: 400px;
-  /* limit width */
+  flex: 1 1 240px;
+  /* Smaller basis for better row fitting */
+  max-width: 320px;
+  min-width: 220px;
 }
 
 .user-card:hover {
@@ -329,6 +327,100 @@ canvas.vu-canvas {
   width: 100%;
   height: 100%;
   display: block;
+}
+
+/* Per-peer Volume Fader (remote cards) */
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.volume-icon {
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.volume-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-input);
+  outline: none;
+  cursor: pointer;
+}
+
+.volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: none;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.volume-slider::-webkit-slider-thumb:hover {
+  background: var(--primary-hover);
+}
+
+.volume-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--primary);
+  border: none;
+  cursor: pointer;
+}
+
+.volume-value {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  min-width: 36px;
+  text-align: right;
+}
+
+/* Connection Quality Indicator (remote cards) */
+.quality-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.quality-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  display: inline-block;
+}
+
+.quality-dot.quality-good {
+  background: var(--success);
+  box-shadow: 0 0 4px var(--success);
+}
+
+.quality-dot.quality-medium {
+  background: var(--warning);
+  box-shadow: 0 0 4px var(--warning);
+}
+
+.quality-dot.quality-bad {
+  background: var(--danger);
+  box-shadow: 0 0 4px var(--danger);
+}
+
+.quality-dot.quality-unknown {
+  background: var(--text-muted);
 }
 
 /* Device Controls */
@@ -393,24 +485,6 @@ canvas.vu-canvas {
 
 .btn-danger:hover {
   background: var(--danger-hover);
-}
-
-/* User Card - More Compact */
-.user-card {
-  background: var(--bg-surface);
-  border-radius: 12px;
-  padding: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  border: 1px solid var(--border);
-  box-shadow: var(--shadow-sm);
-  position: relative;
-  transition: transform 0.2s, box-shadow 0.2s;
-  flex: 1 1 240px;
-  /* Smaller basis for better row fitting */
-  max-width: 320px;
-  min-width: 220px;
 }
 
 /* Prettier Selects */
